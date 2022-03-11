@@ -56,3 +56,5 @@ urllib3==1.26.6
 webencodings==0.5.1
 Werkzeug==1.0.1
 wrapt==1.12.1
+aiohttp
+tqdm
