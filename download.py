@@ -5,127 +5,106 @@ import asyncio
 from tqdm.asyncio import tqdm_asyncio
 from tqdm.contrib.logging import logging_redirect_tqdm
 import pandas as pd
-import json
 import numpy as np
 import time
 import datetime as dt
-from typing import Optional, Union
+from typing import Collection, Dict, List, Optional, Tuple, Union
+
+from yahoo_finance import _download_single_ticker_chart_data, download_ticker_sector_industry
 
 logger = logging.getLogger(__name__)
 
-
-async def _download_single_ticker_info(session: aiohttp.ClientSession, ticker: str):
-    """
-    Download historical data for a single ticker with multithreading. Plus, it scrapes missing stock information.
-
-    Parameters
-    ----------
-    ticker: str
-        Ticker for which to download historical information.
-    interval: str
-        Frequency between data.
-    start: str
-        Start download data from this date.
-    end: str
-        End download data at this date.
-    """
-
-    
-    try:
-        async with session.get("https://finance.yahoo.com/quote/" + ticker) as response:
-            html = await response.text()
-        json_str = html.split("root.App.main =")[1].split("(this)")[0].split(";\n}")[0].strip()
-        info = json.loads(json_str)["context"]["dispatcher"]["stores"]["QuoteSummaryStore"]["summaryProfile"]
-        assert (len(info["sector"]) > 0) and (len(info["industry"]) > 0)
-        return {"SYMBOL": ticker, "SECTOR": info["sector"], "INDUSTRY": info["industry"]}
-    except Exception as e:
-        return {"SYMBOL": ticker, "error": e}
-
-        
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_11_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/50.0.2661.102 Safari/537.36"
+}
 
 
-
-async def _download_single_ticker_chart_data(
-    session: aiohttp.ClientSession, ticker: str, start: int, end: int, interval: str = "1d"
-) -> dict:
-    """
-    Download historical data for a single ticker.
-
-    Parameters
-    ----------
-    ticker: str
-        Ticker for which to download historical information.
-    start: int
-        Start download data from this timestamp date.
-    end: int
-        End download data at this timestamp date.
-    interval: str
-        Frequency between data.
-
-    Returns
-    -------
-    data: dict
-        Scraped dictionary of information.
-    """
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-    params = dict(period1=start, period2=end, interval=interval.lower(), includePrePost="false")
-
-    async with session.get(url, params=params) as response:
-        data_text = await response.text()
-
-        if "Will be right back" in data_text:
-            raise RuntimeError("*** YAHOO! FINANCE is currently down! ***\n")
-        else:
-            response_json = await response.json()
-    try:
-        raw_quotes = response_json["chart"]["result"][0]
-        currency = raw_quotes["meta"]["currency"]
-        return {"ticker": ticker, "quotes": _parse_quotes(raw_quotes), "currency": currency}
-    except Exception as e:
-        if "error" in response_json.get("chart", {}):
-            e = response_json["chart"]["error"]
-        return {"ticker": ticker, "error": e}
-
-async def async_download_tickers_info(
-    tickers: list, tickers_missing_info: list, start: int, end: int, interval: str,
-):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_11_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/50.0.2661.102 Safari/537.36"
-    }
-    async with aiohttp.ClientSession(headers=headers) as session:
+async def download_tickers_sector_industry(tickers: List[str]) -> pd.DataFrame:
+    async with aiohttp.ClientSession(headers=HEADERS) as session:
         print("\nDownloading stock industry and sector")
         with logging_redirect_tqdm():
             tickers_info = await tqdm_asyncio.gather(
-                *[_download_single_ticker_info(session, ticker) for ticker in tickers_missing_info]
+                *[download_ticker_sector_industry(session, ticker) for ticker in tickers]
             )
 
-    no_error_tickers_info = [ticker_info for ticker_info in tickers_info if "error" not in ticker_info]
-    errored_tickers_info = [ticker_info["SYMBOL"] for ticker_info in tickers_info if "error" in ticker_info]
-    print(f"Out of {len(tickers_missing_info)} tickers missing info, we could get {len(no_error_tickers_info)}")
-    print(f"Couldn't get info: {', '.join(errored_tickers_info)}")
+    if None in tickers_info:
+        errored_tickers = [ticker for ticker, ticker_info in zip(tickers, tickers_info) if ticker_info is None]
+        tickers_info = [ticker_info for ticker_info in tickers_info if ticker_info is not None]
+        print(f"Out of {len(tickers)} tickers missing info, we could get {len(tickers_info)}")
+        print(f"Couldn't get info for the following {len(errored_tickers)}: {', '.join(errored_tickers)}")
+
+    return pd.DataFrame(tickers_info, columns=["SYMBOL", "SECTOR", "INDUSTRY"])
 
 
-    async with aiohttp.ClientSession(headers=headers) as session:
+async def download_tickers_quotes(
+    tickers: List[str], start_date: int, end_date: int, interval: str
+) -> Tuple[pd.DataFrame, Dict]:
+    """Download quotes and their currencies for all the specified tickers in the specified time window.
+
+    Parameters
+    ----------
+    tickers : List[str]
+        The list of tickers to download data for
+    start_date : int
+        The start date in POSIX format.
+    end_date : int
+        The end date in POSIX format.
+    interval : str
+        The interval between each data point (e.g. "1d")
+
+    Returns
+    -------
+    Tuple[List[Dict], Dict]
+        A tuple containg two dicts, first the quotes, second their currencies.
+    """
+    async with aiohttp.ClientSession(headers=HEADERS) as session:
         print("\nDownloading stock quotes")
         with logging_redirect_tqdm():
-            all_tickers_chart_data = await tqdm_asyncio.gather(
-                *[_download_single_ticker_chart_data(session, ticker, start, end, interval) for ticker in tickers]
+            tickers_chart_data = await tqdm_asyncio.gather(
+                *[
+                    _download_single_ticker_chart_data(session, ticker, start_date, end_date, interval)
+                    for ticker in tickers
+                ]
             )
-    quotes = {ticker_dict["ticker"]: ticker_dict["quotes"] for ticker_dict in all_tickers_chart_data if "error" not in ticker_dict}
-    errored_tickers_quotes = [ticker_dict["ticker"] for ticker_dict in all_tickers_chart_data if "error" in ticker_dict]
-    print(f"Out of {len(tickers)} tickers, we could get quotes for {len(quotes)}")
-    print(f"Couldn't get quotes for: {', '.join(errored_tickers_quotes)}")
-    quotes_df = pd.concat(quotes.values(), keys=quotes.keys(), axis=1, sort=True)
 
-    stock_info_df = pd.DataFrame(no_error_tickers_info, columns=["SYMBOL", "CURRENCY", "SECTOR", "INDUSTRY"])
-    currencies = {ticker_dict["ticker"]: ticker_dict["currency"] for ticker_dict in all_tickers_chart_data if "error" not in ticker_dict}
-    stock_info_df["CURRENCY"] = stock_info_df["SYMBOL"].apply(currencies.get)
+    if None in tickers_chart_data:
+        errored_tickers = [ticker for ticker, ticker_info in zip(tickers, tickers_chart_data) if ticker_info is None]
+        tickers_chart_data = [t for t in tickers_chart_data if t is not None]
+        print(f"Out of {len(tickers)} tickers, we could get quotes for {len(tickers_chart_data)}")
+        print(f"Couldn't get quotes for: {', '.join(errored_tickers)}")
 
-    return quotes_df, stock_info_df
+    quotes = {ticker_dict["ticker"]: ticker_dict["quotes"] for ticker_dict in tickers_chart_data}
+    currencies = {ticker_dict["ticker"]: ticker_dict["currency"] for ticker_dict in tickers_chart_data}
+
+    return pd.concat(quotes, axis="columns", sort=True), currencies
+
+
+def extract_ticker_list(tickers: Union[Collection[str], str]) -> List[str]:
+    if isinstance(tickers, (list, set, tuple)):
+        pass
+    elif isinstance(tickers, str):
+        # Replacing commas by spaces helps removing excess spaces between commas if any
+        tickers = tickers.replace(",", " ").split()
+    else:
+        raise ValueError("tickers must be a str consisting of a comma separated list of tickers or a list of tickers")
+
+    return list(set([ticker.upper() for ticker in tickers]))
+
+
+def parse_start_end_date(
+    start_date: Optional[str] = None, end_date: Optional[str] = None, default_start_days_ago=365
+) -> Tuple[int, int]:
+    end_date = int(time.time()) if end_date is None else int(dt.datetime.strptime(end_date, "%Y-%m-%d").timestamp())
+    start_date = (
+        int((dt.datetime.today() - dt.timedelta(365)).timestamp())
+        if start_date is None
+        else int(dt.datetime.strptime(start_date, "%Y-%m-%d").timestamp())
+    )
+    return start_date, end_date
 
 
 def download_tickers_info(
-    tickers: list, start: Optional[str] = None, end: Optional[str] = None, interval: str = "1d"
+    tickers: list, start_date: Optional[str] = None, end_date: Optional[str] = None, interval: str = "1d"
 ) -> dict:
     """
     Download historical data for tickers in the list.
@@ -151,122 +130,80 @@ def download_tickers_info(
         - sectors: dictionary of stock sector for each ticker;
         - industries: dictionary of stock industry for each ticker.
     """
-    tickers = tickers if isinstance(tickers, (list, set, tuple)) else tickers.replace(",", " ").split()
-    tickers = list(set([ticker.upper() for ticker in tickers]))
 
     logger.info(f"Downloading data for {len(tickers)} tickers")
 
-    stock_info_columns = ["SYMBOL", "CURRENCY", "SECTOR", "INDUSTRY"]
+    tickers = extract_ticker_list(tickers)
+
     stock_info_filename = "stock_info.csv"
 
     try:
-        cached_stock_info_df = pd.read_csv(stock_info_filename)
+        stock_info_df = pd.read_csv(stock_info_filename)
         logger.info(f"Reading stock info found in file '{stock_info_filename}'")
     except FileNotFoundError:
-        cached_stock_info_df = pd.DataFrame(columns=stock_info_columns)
+        # Creating an empty dataframe
+        stock_info_columns = ["SYMBOL", "CURRENCY", "SECTOR", "INDUSTRY"]
+        stock_info_df = pd.DataFrame(columns=stock_info_columns)
 
-    tickers_already_fetched_info = cached_stock_info_df["SYMBOL"].values
+    # Downloading stock quotes and currencies
+    start_date, end_date = parse_start_end_date(start_date, end_date)
+    stocks_quotes_df, currencies = asyncio.run(download_tickers_quotes(tickers, start_date, end_date, interval))
 
-    tickers_misssing_info = [ticker for ticker in tickers if ticker not in tickers_already_fetched_info]
+    # Remove tickers with excess null values
+    stocks_quotes_df = stocks_quotes_df.loc[:, (stocks_quotes_df.isnull().mean() < 0.33)]
+    assert stocks_quotes_df.shape[0] > 0, Exception("No symbol with full information is available.")
 
-    end = int(time.time()) if end is None else int(dt.datetime.strptime(end, "%Y-%m-%d").timestamp())
-    start = (
-        int((dt.datetime.today() - dt.timedelta(365)).timestamp())
-        if start is None
-        else int(dt.datetime.strptime(start, "%Y-%m-%d").timestamp())
-    )
-
-    stocks_quotes_df, newly_fetched_stock_info_df = asyncio.run(
-        async_download_tickers_info(tickers, tickers_misssing_info, start, end, interval)
-    )
-
-    full_stock_info_df = pd.concat([cached_stock_info_df, newly_fetched_stock_info_df])
-    full_stock_info_df.to_csv(stock_info_filename, index=False)
-
-    if stocks_quotes_df.shape[0] == 0:
-        raise Exception("No symbol with full information is available.")
-
-    stocks_quotes_df = stocks_quotes_df.drop(
-        columns=stocks_quotes_df.columns[stocks_quotes_df.isnull().sum(0) > 0.33 * stocks_quotes_df.shape[0]]
-    )
+    # Fill in null values
     stocks_quotes_df = stocks_quotes_df.fillna(method="bfill").fillna(method="ffill").drop_duplicates()
 
-    tickers_misssing_info = [
-        ticker for ticker in tickers if ticker not in stocks_quotes_df.columns.get_level_values(0)[::2].tolist()
-    ]
-    tickers = stocks_quotes_df.columns.get_level_values(0)[::2].tolist()
-    if len(tickers_misssing_info) > 0:
+    final_list_tickers = stocks_quotes_df.columns.get_level_values(0).unique()
+    failed_to_get_tickers_quotes = [ticker for ticker in tickers if ticker not in final_list_tickers]
+    if len(failed_to_get_tickers_quotes) > 0:
         print(
-            f"\nRemoving {tickers_misssing_info} from list of symbols because we could not collect full information."
+            f"\nRemoving {failed_to_get_tickers_quotes} from list of symbols because we could not collect complete quotes."
         )
 
-    # download exchange rates and convert to most common currency
-    currencies = full_stock_info_df["CURRENCY"].to_list()
-    default_currency = full_stock_info_df["CURRENCY"].mode()[0]
-    xrates = get_exchange_rates(currencies, default_currency, stocks_quotes_df.index, start, end, interval)
+    # Downloading missing stocks info
+    tickers_already_fetched_info = stock_info_df["SYMBOL"].values
+    tickers_missing_info = [ticker for ticker in tickers if ticker not in tickers_already_fetched_info]
+    if len(tickers_missing_info) > 0:
+        missing_tickers_info_df = asyncio.run(download_tickers_sector_industry(tickers_missing_info))
+        missing_tickers_info_df["CURRENCY"] = missing_tickers_info_df["SYMBOL"].apply(currencies.get)
+        stock_info_df = pd.concat([stock_info_df, missing_tickers_info_df])
+        stock_info_df.to_csv(stock_info_filename, index=False)
 
-    return dict(
-        tickers=tickers,
-        dates=pd.to_datetime(stocks_quotes_df.index),
-        price=stocks_quotes_df.iloc[:, stocks_quotes_df.columns.get_level_values(1) == "Adj Close"].to_numpy().T,
-        volume=stocks_quotes_df.iloc[:, stocks_quotes_df.columns.get_level_values(1) == "Volume"].to_numpy().T,
-        currencies=currencies,
-        exchange_rates=xrates,
-        default_currency=default_currency,
-        sectors={
-            stock_info_row["SYMBOL"]: stock_info_row["SECTOR"] for _, stock_info_row in full_stock_info_df.iterrows()
-        },
-        industries={
-            stock_info_row["SYMBOL"]: stock_info_row["INDUSTRY"] for _, stock_info_row in full_stock_info_df.iterrows()
-        },
+    # Taking the quote currency as the one that appears the most in the data
+    default_currency = stock_info_df["CURRENCY"].mode()[0]
+    # Downloading the exchange rate between the default currency and all the others in the data
+    currencies = stock_info_df["CURRENCY"].to_list()
+    exchange_rates = get_exchange_rates(
+        from_currencies=stock_info_df["CURRENCY"].dropna().to_list(),
+        to_currency=default_currency,
+        dates_index=stocks_quotes_df.index,
+        start_date=start_date,
+        end_date=end_date,
+        interval=interval,
     )
 
-
-def _parse_quotes(data: dict, parse_volume: bool = True) -> pd.DataFrame:
-    """
-    It creates a data frame of adjusted closing prices, and, if `parse_volume=True`, volumes. If no adjusted closing
-    price is available, it sets it equal to closing price.
-
-    Parameters
-    ----------
-    data: dict
-        Data containing historical information of corresponding stock.
-    parse_volume: bool
-        Include or not volume information in the data frame.
-    """
-    timestamps = data["timestamp"]
-    ohlc = data["indicators"]["quote"][0]
-    closes = ohlc["close"]
-    if parse_volume:
-        volumes = ohlc["volume"]
-    try:
-        adjclose = data["indicators"]["adjclose"][0]["adjclose"]
-    except:
-        adjclose = closes
-
-    # fix NaNs in the second-last entry of adjusted closing prices
-    if adjclose[-2] is None:
-        adjclose[-2] = adjclose[-1]
-
-    assert (np.array(adjclose) > 0).all()
-
-    quotes = {"Adj Close": adjclose}
-    if parse_volume:
-        quotes["Volume"] = volumes
-    quotes = pd.DataFrame(quotes)
-    quotes.index = pd.to_datetime(timestamps, unit="s").date
-    quotes.sort_index(inplace=True)
-    quotes = quotes.loc[~quotes.index.duplicated(keep="first")]
-
-    return quotes
+    return dict(
+        tickers=final_list_tickers,
+        dates=pd.to_datetime(stocks_quotes_df.index),
+        price=stocks_quotes_df.xs("Adj Close", level=1, axis="columns").to_numpy().T,
+        volume=stocks_quotes_df.xs("Volume", level=1, axis="columns").to_numpy().T,
+        currencies=currencies,
+        exchange_rates=exchange_rates,
+        default_currency=default_currency,
+        sectors={ticker: sector for ticker, sector in zip(stock_info_df["SYMBOL"], stock_info_df["SECTOR"])},
+        industries={ticker: industry for ticker, industry in zip(stock_info_df["SYMBOL"], stock_info_df["INDUSTRY"])},
+    )
 
 
 def get_exchange_rates(
     from_currencies: list,
     to_currency: str,
-    dates: pd.Index,
-    start: Union[str, int] = None,
-    end: Union[str, int] = None,
+    dates_index: pd.DatetimeIndex,
+    start_date: int,
+    end_date: int,
     interval: str = "1d",
 ) -> dict:
     """
@@ -293,27 +230,35 @@ def get_exchange_rates(
     xrates: dict
         A dictionary with currencies as keys and list of exchange rates at desired dates as values.
     """
-    if end is None:
-        end = int(dt.datetime.timestamp(dt.datetime.today()))
-    elif type(end) is str:
-        end = int(dt.datetime.timestamp(dt.datetime.strptime(end, "%Y-%m-%d")))
-    if start is None:
-        start = int(dt.datetime.timestamp(dt.datetime.today() - dt.timedelta(365)))
-    elif type(start) is str:
-        start = int(dt.datetime.timestamp(dt.datetime.strptime(start, "%Y-%m-%d")))
 
-    ucurrencies, counts = np.unique(from_currencies, return_counts=True)
-    tmp = {}
-    if to_currency not in ucurrencies or len(ucurrencies) > 1:
-        for curr in ucurrencies:
-            if curr != to_currency:
-                tmp[curr] = _download_single_ticker_chart_data(curr + to_currency + "=x", start, end, interval)
-                tmp[curr] = _parse_quotes(tmp[curr]["chart"]["result"][0], parse_volume=False)["Adj Close"]
-        tmp = pd.concat(tmp.values(), keys=tmp.keys(), axis=1, sort=True)
-        xrates = pd.DataFrame(index=dates, columns=tmp.columns)
-        xrates.loc[xrates.index.isin(tmp.index)] = tmp
-        xrates = xrates.fillna(method="bfill").fillna(method="ffill")
-        xrates.to_dict(orient="list")
-    else:
-        xrates = tmp
-    return xrates
+    from_currencies = [currency for currency in np.unique(from_currencies) if currency != to_currency]
+
+    if len(from_currencies) == 0:
+        return {}
+
+    xrates = asyncio.run(async_get_exchange_rates(from_currencies, to_currency, start_date, end_date, interval))
+    xrates.reindex = dates_index
+    xrates = xrates.fillna(method="bfill").fillna(method="ffill")
+
+    return xrates.to_dict(orient="list")
+
+
+async def async_get_exchange_rates(
+    from_currencies: list,
+    to_currency: str,
+    start_date: int,
+    end_date: int,
+    interval: str,
+):
+    async with aiohttp.ClientSession(headers=HEADERS) as session:
+        currencies_chart_data = await asyncio.gather(
+            *[
+                _download_single_ticker_chart_data(
+                    session, from_currency + to_currency + "=x", start_date, end_date, interval
+                )
+                for from_currency in from_currencies
+            ]
+        )
+
+    quotes = [chart_data["quotes"]["Adj Close"] for chart_data in currencies_chart_data]
+    return pd.concat(quotes, keys=from_currencies, axis="columns", sort=True)

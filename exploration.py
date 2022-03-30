@@ -7,68 +7,67 @@ import csv
 import os.path
 import pickle
 
-from download import download
+from download import download_tickers_info
 from volatile import estimate_logprice_statistics, estimate_price_statistics, rate
-from tools import convert_currency, extract_hierarchical_info
+from utils import convert_currency, extract_hierarchical_info
 from plotting import *
 from models import *
 
 import multitasking
 
-if __name__ == '__main__':
-    cli = ArgumentParser('Volatile: your day-to-day trading companion.',
-                         formatter_class=ArgumentDefaultsHelpFormatter)
-    cli.add_argument('-s', '--symbols', type=str, nargs='+', help=SUPPRESS)
-    cli.add_argument('--rank', type=str, default="rate",
-                     help="If `rate`, stocks are ranked in the prediction table and in the stock estimation plot from "
-                          "the highest below to the highest above trend; if `growth`, ranking is done from the largest"
-                          " to the smallest trend growth at current date; if `volatility`, from the largest to the "
-                          "smallest current volatility estimate.")
-    cli.add_argument('--save-table', action='store_true',
-                     help='Save prediction table in csv format.')
-    cli.add_argument('--no-plots', action='store_true',
-                     help='Plot estimates with their uncertainty over time.')
-    cli.add_argument('--plot-losses', action='store_true',
-                     help='Plot loss function decay over training iterations.')
-    cli.add_argument('--cache', action='store_true',
-                     help='Use cached data and parameters if available.')
+if __name__ == "__main__":
+    cli = ArgumentParser("Volatile: your day-to-day trading companion.", formatter_class=ArgumentDefaultsHelpFormatter)
+    cli.add_argument("-s", "--symbols", type=str, nargs="+", help=SUPPRESS)
+    cli.add_argument(
+        "--rank",
+        type=str,
+        default="rate",
+        help="If `rate`, stocks are ranked in the prediction table and in the stock estimation plot from "
+        "the highest below to the highest above trend; if `growth`, ranking is done from the largest"
+        " to the smallest trend growth at current date; if `volatility`, from the largest to the "
+        "smallest current volatility estimate.",
+    )
+    cli.add_argument("--save-table", action="store_true", help="Save prediction table in csv format.")
+    cli.add_argument("--no-plots", action="store_true", help="Plot estimates with their uncertainty over time.")
+    cli.add_argument("--plot-losses", action="store_true", help="Plot loss function decay over training iterations.")
+    cli.add_argument("--cache", action="store_true", help="Use cached data and parameters if available.")
     args = cli.parse_args()
 
-    if args.cache and os.path.exists('data.pickle'):
-        print('\nLoading last year of data...')
-        with open('data.pickle', 'rb') as handle:
+    if args.cache and os.path.exists("data.pickle"):
+        print("\nLoading last year of data...")
+        with open("data.pickle", "rb") as handle:
             data = pickle.load(handle)
-        print('Data has been saved to {}/{}.'.format(os.getcwd(), 'data.pickle'))
+        print("Data has been saved to {}/{}.".format(os.getcwd(), "data.pickle"))
     else:
         if args.symbols is None:
             with open("symbols_list.txt", "r") as my_file:
                 args.symbols = my_file.readlines()[0].split(" ")
-        print('\nDownloading last year of data...')
-        data = download(args.symbols)
+        print("\nDownloading last year of data...")
+        data = download_tickers_info(args.symbols)
 
-        with open('data.pickle', 'wb') as handle:
+        with open("data.pickle", "wb") as handle:
             pickle.dump(data, handle)
 
     tickers = data["tickers"]
-    logp = np.log(data['price'])
+    logp = np.log(data["price"])
 
     # convert currencies to most frequent one
-    for i, curr in enumerate(data['currencies']):
-        if curr != data['default_currency']:
-            logp[i] = convert_currency(logp[i], np.array(data['exchange_rates'][curr]), type='forward')
+    for i, curr in enumerate(data["currencies"]):
+        if curr != data["default_currency"]:
+            logp[i] = convert_currency(logp[i], np.array(data["exchange_rates"][curr]), type="forward")
 
     num_stocks, t = logp.shape
 
-    info = extract_hierarchical_info(data['sectors'], data['industries'])
+    info = extract_hierarchical_info(data["sectors"], data["industries"])
 
     print("\nTraining a model that discovers correlations...")
     # order of the polynomial
     order = 52
 
     # times corresponding to trading dates in the data
-    info['tt'] = (np.linspace(1 / t, 1, t) ** np.arange(order + 1).reshape(-1, 1)).astype('float32')
+    info["tt"] = (np.linspace(1 / t, 1, t) ** np.arange(order + 1).reshape(-1, 1)).astype("float32")
     # reweighing factors for parameters corresponding to different orders of the polynomial
-    info['order_scale'] = np.ones((1, order + 1), dtype='float32')
+    info["order_scale"] = np.ones((1, order + 1), dtype="float32")
 
     # train the model
     phi_m, psi_m, phi_s, psi_s, phi_i, psi_i, phi, psi = train_msis_mcs(logp, info, num_steps=50000)
@@ -76,7 +75,7 @@ if __name__ == '__main__':
     print("Training completed.")
 
     print("Compute a metric of stock correlation.")
-    tt = info['tt']
+    tt = info["tt"]
     dtt = np.arange(1, tt.shape[0])[:, None] * tt[1:] / tt[1, None]
     dlogp_est = np.dot(phi.numpy()[:, 1:], dtt)
 
@@ -87,9 +86,9 @@ if __name__ == '__main__':
     order = 2
 
     # times corresponding to trading dates in the data
-    info['tt'] = (np.linspace(1 / t, 1, t) ** np.arange(order + 1).reshape(-1, 1)).astype('float32')
+    info["tt"] = (np.linspace(1 / t, 1, t) ** np.arange(order + 1).reshape(-1, 1)).astype("float32")
     # reweighing factors for parameters corresponding to different orders of the polynomial
-    info['order_scale'] = np.linspace(1 / (order + 1), 1, order + 1)[::-1].astype('float32')[None, :]
+    info["order_scale"] = np.linspace(1 / (order + 1), 1, order + 1)[::-1].astype("float32")[None, :]
 
     # train the model
     phi_m, psi_m, phi_s, psi_s, phi_i, psi_i, phi, psi = train_msis_mcs(logp, info, plot_losses=args.plot_losses)
@@ -98,13 +97,13 @@ if __name__ == '__main__':
 
     ## log-price statistics (Normal distribution)
     # calculate stock-level estimators of log-prices
-    logp_est, std_logp_est = estimate_logprice_statistics(phi.numpy(), psi.numpy(), info['tt'])
+    logp_est, std_logp_est = estimate_logprice_statistics(phi.numpy(), psi.numpy(), info["tt"])
 
     # convert log-price currencies back (standard deviations of log-prices stay the same)
-    for i, curr in enumerate(data['currencies']):
-        if curr != data['default_currency']:
-            logp[i] = convert_currency(logp[i], np.array(data['exchange_rates'][curr]), type='backward')
-            logp_est[i] = convert_currency(logp_est[i], np.array(data['exchange_rates'][curr]), type='backward')
+    for i, curr in enumerate(data["currencies"]):
+        if curr != data["default_currency"]:
+            logp[i] = convert_currency(logp[i], np.array(data["exchange_rates"][curr]), type="backward")
+            logp_est[i] = convert_currency(logp_est[i], np.array(data["exchange_rates"][curr]), type="backward")
 
     ## price statistics (log-Normal distribution)
     # calculate stock-level estimators of prices
@@ -145,7 +144,7 @@ if __name__ == '__main__':
                 idx_set = np.random.choice(num_stocks, num_set, p=prob, replace=False)
                 choice_unknown = False
             else:
-                choice = choice.replace(',', ' ').split()
+                choice = choice.replace(",", " ").split()
                 loc_choice = []
                 tickers_set = np.array(tickers)[idx_set]
                 for c in choice:
@@ -155,7 +154,7 @@ if __name__ == '__main__':
                     else:
                         loc_choice.append(where_c[0])
                 if len(loc_choice) < len(choice):
-                    print('Please choose stocks among the current choice set.')
+                    print("Please choose stocks among the current choice set.")
                 else:
                     idx_choice = idx_set[loc_choice]
                     idx_choice_all.update(idx_choice)

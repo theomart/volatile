@@ -5,12 +5,16 @@ import csv
 import os.path
 import pickle
 
-from download import download
-from tools import convert_currency, extract_hierarchical_info
-from plotting import *
-from models import *
+from download import download_tickers_info
+from utils import convert_currency, extract_hierarchical_info
+import models
+import plotting
 
 import multitasking
+
+import logging
+
+logging.basicConfig(level=logging.INFO)
 
 
 def softplus(x: np.array) -> np.array:
@@ -60,7 +64,7 @@ def estimate_price_statistics(mu: np.array, sigma: np.array):
     -------
     It returns a tuple of mean and standard deviation price estimators.
     """
-    return np.exp(mu + sigma ** 2 / 2), np.sqrt(np.exp(2 * mu + sigma ** 2) * (np.exp(sigma ** 2) - 1))
+    return np.exp(mu + sigma**2 / 2), np.sqrt(np.exp(2 * mu + sigma**2) * (np.exp(sigma**2) - 1))
 
 
 def rate(scores: np.array, lower_bounds: dict = None) -> list:
@@ -193,6 +197,7 @@ if __name__ == "__main__":
     cli.add_argument(
         "--rank",
         type=str,
+        choices=["rate", "growth", "volatility"],
         default="rate",
         help="If `rate`, stocks are ranked in the prediction table and in the stock estimation plot from "
         "the highest below to the highest above trend; if `growth`, ranking is done from the largest"
@@ -203,35 +208,36 @@ if __name__ == "__main__":
     cli.add_argument("--no-plots", action="store_true", help="Plot estimates with their uncertainty over time.")
     cli.add_argument("--plot-losses", action="store_true", help="Plot loss function decay over training iterations.")
     cli.add_argument("--cache", action="store_true", help="Use cached data and parameters if available.")
+
     args = cli.parse_args()
 
-    if args.rank.lower() not in ["rate", "growth", "volatility"]:
-        raise Exception("{} not recognized. Please provide one between `rate` and `growth`.".format(args.rank))
+    current_working_directory = os.getcwd()
+    cached_data_filename = "data.pickle"
 
-    if args.cache and os.path.exists("data.pickle"):
+    if args.cache and os.path.exists(cached_data_filename):
         print("\nLoading last year of data...")
-        with open("data.pickle", "rb") as handle:
-            data = pickle.load(handle)
-        print("Data has been saved to {}/{}.".format(os.getcwd(), "data.pickle"))
+        with open(cached_data_filename, "rb") as file:
+            data = pickle.load(file)
+        print(f"Data has been saved to {current_working_directory}/{cached_data_filename}")
     else:
         if args.symbols is None:
-            with open("symbols_list.txt", "r") as my_file:
-                args.symbols = my_file.readlines()[0].split(" ")
+            with open("symbols_list.txt", "r") as file:
+                args.symbols = file.readlines()[0].split(" ")
         print("\nDownloading last year of data...")
-        data = download(args.symbols)
+        data = download_tickers_info(args.symbols)
 
-        with open("data.pickle", "wb") as handle:
-            pickle.dump(data, handle)
+        with open(cached_data_filename, "wb") as file:
+            pickle.dump(data, file)
 
     tickers = data["tickers"]
-    logp = np.log(data["price"])
+    log_price = np.log(data["price"])
 
     # convert currencies to most frequent one
-    for i, curr in enumerate(data["currencies"]):
-        if curr != data["default_currency"]:
-            logp[i] = convert_currency(logp[i], np.array(data["exchange_rates"][curr]), type="forward")
+    for i, currency in enumerate(data["currencies"]):
+        if currency != data["default_currency"]:
+            log_price[i] = convert_currency(log_price[i], np.array(data["exchange_rates"][currency]), type="forward")
 
-    num_stocks, t = logp.shape
+    num_stocks, t = log_price.shape
 
     info = extract_hierarchical_info(data["sectors"], data["industries"])
 
@@ -246,7 +252,7 @@ if __name__ == "__main__":
         info["order_scale"] = np.ones((1, order + 1), dtype="float32")
 
         # train the model
-        phi_m, psi_m, phi_s, psi_s, phi_i, psi_i, phi, psi = train_msis_mcs(logp, info, num_steps=50000)
+        phi_m, psi_m, phi_s, psi_s, phi_i, psi_i, phi, psi = models.train_msis_mcs(log_price, info, num_steps=50000)
 
         print("Training completed.")
 
@@ -267,7 +273,9 @@ if __name__ == "__main__":
     info["order_scale"] = np.linspace(1 / (order + 1), 1, order + 1)[::-1].astype("float32")[None, :]
 
     # train the model
-    phi_m, psi_m, phi_s, psi_s, phi_i, psi_i, phi, psi = train_msis_mcs(logp, info, plot_losses=args.plot_losses)
+    phi_m, psi_m, phi_s, psi_s, phi_i, psi_i, phi, psi = models.train_msis_mcs(
+        log_price, info, plot_losses=args.plot_losses
+    )
 
     print("Training completed.")
 
@@ -285,15 +293,15 @@ if __name__ == "__main__":
     logp_mkt_est, std_logp_mkt_est = estimate_logprice_statistics(phi_m.numpy(), psi_m.numpy(), info["tt"])
 
     # compute score
-    scores = (logp_pred[:, horizon] - logp[:, -1]) / std_logp_pred.squeeze()
+    scores = (logp_pred[:, horizon] - log_price[:, -1]) / std_logp_pred.squeeze()
     # compute growth as percentage price variation
     growth = np.dot(phi.numpy()[:, 1:], np.arange(1, order + 1)) / t
 
     # convert log-price currencies back (standard deviations of log-prices stay the same)
-    for i, curr in enumerate(data["currencies"]):
-        if curr != data["default_currency"]:
-            logp[i] = convert_currency(logp[i], np.array(data["exchange_rates"][curr]), type="backward")
-            logp_est[i] = convert_currency(logp_est[i], np.array(data["exchange_rates"][curr]), type="backward")
+    for i, currency in enumerate(data["currencies"]):
+        if currency != data["default_currency"]:
+            log_price[i] = convert_currency(log_price[i], np.array(data["exchange_rates"][currency]), type="backward")
+            logp_est[i] = convert_currency(logp_est[i], np.array(data["exchange_rates"][currency]), type="backward")
 
     ## price statistics (log-Normal distribution)
     # calculate stock-level estimators of prices
@@ -331,12 +339,12 @@ if __name__ == "__main__":
     ranked_rates = rate(ranked_scores)
 
     if not args.no_plots:
-        plot_market_estimates(data, p_mkt_est, std_p_mkt_est)
-        plot_sector_estimates(data, info, p_sec_est, std_p_sec_est)
-        plot_industry_estimates(data, info, p_ind_est, std_p_ind_est)
-        plot_stock_estimates(data, p_est, std_p_est, args.rank, rank, ranked_rates)
+        plotting.plot_market_estimates(data, p_mkt_est, std_p_mkt_est)
+        plotting.plot_sector_estimates(data, info, p_sec_est, std_p_sec_est)
+        plotting.plot_industry_estimates(data, info, p_ind_est, std_p_ind_est)
+        plotting.plot_stock_estimates(data, p_est, std_p_est, args.rank, rank, ranked_rates)
         if num_stocks > 1:
-            plot_matches(data, matches)
+            plotting.plot_matches(data, matches)
 
     print("\nPREDICTION TABLE")
     ranked_sectors = [
@@ -388,4 +396,3 @@ if __name__ == "__main__":
             for row in table:
                 wr.writerow(row)
         print("\nThe prediction table printed above has been saved to {}/{}.".format(os.getcwd(), tab_name))
-
